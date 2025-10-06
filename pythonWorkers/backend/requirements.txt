@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+conductor-python
+cohere
+requests
+aiofiles
+aiohttp
+python-dotenv
+pillow
+pytesseract
+pypdf2
+opencv-python
+numpy
+pydub
+httpx

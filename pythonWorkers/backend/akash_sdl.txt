@@ -1,0 +1,123 @@
+version: "2.0"
+
+services:
+  ai-image-generator:   # GPU: text->image
+    image: nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+    expose:
+      - port: 8080
+        as: 80
+        to: [ { global: true } ]
+    env:
+      - MODEL_NAME=stabilityai/sd-turbo
+      - HF_HOME=/opt/models
+      - TRANSFORMERS_CACHE=/opt/models
+      - DIFFUSERS_CACHE=/opt/models
+      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
+    command:
+      - /bin/sh
+      - -lc
+      - |
+        set -e
+        apt-get update && apt-get install -y --no-install-recommends python3 python3-pip git && rm -rf /var/lib/apt/lists/*
+        python3 -m pip install --no-cache-dir --upgrade pip
+        python3 -m pip install --no-cache-dir torch==2.3.1+cu121 --index-url https://download.pytorch.org/whl/cu121
+        python3 -m pip install --no-cache-dir diffusers==0.29.2 transformers==4.44.2 accelerate==0.34.2 safetensors==0.4.4 pillow==10.4.0 flask==3.0.3 gunicorn==22.0.0
+        cat > /server.py << 'PY'
+        import base64, os
+        from io import BytesIO
+        from flask import Flask, request, jsonify
+        from diffusers import AutoPipelineForText2Image
+        import torch
+        app = Flask(__name__)
+        model_id = os.environ.get("MODEL_NAME", "stabilityai/sd-turbo")
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        pipe = AutoPipelineForText2Image.from_pretrained(
+          model_id,
+          torch_dtype=torch.float16 if device=="cuda" else torch.float32,
+          use_safetensors=True
+        ).to(device)
+        @app.get("/health")
+        def health():
+          return jsonify({"status":"healthy","model":model_id,"device":device})
+        @app.post("/generate-image")
+        def generate_image():
+          try:
+            data = request.get_json(force=True) or {}
+            prompt = data.get("prompt","a clean futuristic science illustration")
+            w = int(data.get("width",512)); h = int(data.get("height",512))
+            # Clamp dimensions for SD-Turbo optimal performance
+            w = max(256, min(1024, w)); h = max(256, min(1024, h))
+            if device == "cuda": torch.cuda.empty_cache()
+            img = pipe(prompt=prompt, width=w, height=h, num_inference_steps=2, guidance_scale=0.0).images[0]
+            buf = BytesIO(); img.save(buf, format="PNG")
+            return jsonify({"success":True,"image": base64.b64encode(buf.getvalue()).decode()})
+          except Exception as e:
+            return jsonify({"success":False,"error":str(e)}), 500
+        if __name__ == "__main__":
+          app.run(host="0.0.0.0", port=8080)
+        PY
+        exec gunicorn -b 0.0.0.0:8080 server:app --workers 1 --threads 1
+
+  media-assembler:      # CPU: ffmpeg (future step; lightweight)
+    image: jrottenberg/ffmpeg:6.0-ubuntu
+    expose:
+      - port: 9090
+        as: 9090
+        to: [ { global: true } ]
+    command:
+      - /bin/sh
+      - -lc
+      - |
+        # dummy health endpoint so the service boots cleanly
+        cat > /server.sh <<'SH'
+        while true; do { echo -e "HTTP/1.1 200 OK\r\n\r\nok"; } | nc -l -p 9090 -q 1; done
+        SH
+        chmod +x /server.sh
+        ./server.sh
+
+profiles:
+  compute:
+    ai-image-generator-gpu:
+      resources:
+        cpu:
+          units: 2
+        memory:
+          size: 8Gi
+        gpu:
+          units: 1
+          attributes:
+            vendor:
+              nvidia:
+                - model: all
+        storage:
+          - size: 20Gi
+    media-assembler-cpu:
+      resources:
+        cpu:
+          units: 2
+        memory:
+          size: 4Gi
+        storage:
+          - size: 5Gi
+
+  placement:
+    mainnet-gpu:
+      pricing:
+        ai-image-generator-gpu:
+          denom: uakt
+          amount: 700   # ~10.1 AKT/day target on GPU
+    mainnet-cpu:
+      pricing:
+        media-assembler-cpu:
+          denom: uakt
+          amount: 12    # ~0.17 AKT/day for the CPU helper
+
+deployment:
+  ai-image-generator:
+    mainnet-gpu:
+      profile: ai-image-generator-gpu
+      count: 1
+  media-assembler:
+    mainnet-cpu:
+      profile: media-assembler-cpu
+      count: 1
